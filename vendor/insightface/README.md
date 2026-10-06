@@ -1,0 +1,2 @@
+SCRFD inference code from InsightFace v0.7 (MIT). Only modification: removed unused onnx import. Model weights have separate non-commercial research terms.
+Source: https://raw.githubusercontent.com/deepinsight/insightface/v0.7/python-package/insightface/model_zoo/scrfd.py

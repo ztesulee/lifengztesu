@@ -1,0 +1,29 @@
+# Local runtime and installed dependencies
+__pycache__/
+*.py[cod]
+.deps/
+.build_deps/
+.venv/
+venv/
+models/
+logs/
+test-artifacts/
+dist/
+build/
+
+# Photography projects, contact accounts and machine settings
+projects/
+.last-project.json
+.history-notice.json
+.openfrp-settings.json
+.qq-contact-aliases.json
+摄影选片.toml
+
+# Downloaded executables
+vendor/openfrp/
+
+# Temporary/editor files
+*.tmp
+*.part
+.idea/
+.vscode/

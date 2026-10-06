@@ -1,0 +1,1 @@
+OSNet architecture copied from https://github.com/KaiyangZhou/deep-person-reid/blob/master/torchreid/models/osnet.py (MIT). Used for local export only. Weights: official kaiyangzhou/osnet repository, osnet_x0_5 MSMT17 combineall. Inference uses the exported ONNX model.

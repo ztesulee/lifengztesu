@@ -1,0 +1,7 @@
+numpy>=1.24,<2.1
+opencv-python>=4.10,<5
+Pillow>=10
+imageio-ffmpeg>=0.6
+qrcode>=8
+rawpy==0.21.0
+pywinauto==0.6.9; sys_platform == 'win32'

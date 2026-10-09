@@ -8,7 +8,7 @@ from pathlib import Path
 logger = logging.getLogger('return_app.qq')
 logger.addHandler(logging.NullHandler())
 if os.environ.get('PHOTO_RETURN_DEBUG') == '1':
-    folder = Path(__file__).resolve().parent / 'logs'
+    folder = (Path(sys.executable).resolve().parent if getattr(sys,'frozen',False) else Path(__file__).resolve().parent) / 'logs'
     folder.mkdir(exist_ok=True)
     path = folder / ('qq-debug-' + datetime.now().strftime('%Y%m%d-%H%M%S') + '.log')
     formatter = logging.Formatter('%(asctime)s [%(threadName)s] %(levelname)s %(message)s')

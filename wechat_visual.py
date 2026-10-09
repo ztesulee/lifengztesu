@@ -34,7 +34,7 @@ def compact(text):
 
 def archive_label_matches(text, filename):
     value, expected = compact(text), compact(filename)
-    if expected in value:
+    if expected == value:
         return True
     pieces = re.split(r'\.{2,}|…+', value)
     return (len(pieces) == 2 and len(pieces[0]) >= 4 and len(pieces[1]) >= 5
@@ -114,7 +114,7 @@ def chat_title_text(lines, width, height):
     for line in lines:
         value = compact(line['text'])
         x1,y1,x2,y2 = line_box(line)
-        if (width*.25 < x1 < width*.75 and 28 < y1 < min(140,height*.15)
+        if (min(width*.25,220) < x1 < width*.8 and 28 < y1 < min(140,height*.15)
                 and value not in ('搜索','发送','0','O','o')
                 and re.search(r'[\w\u4e00-\u9fff]',value)):
             candidates.append((y1,x1,x2,y2,value))
@@ -140,6 +140,25 @@ def toolbar_point(width, height, action):
     return int(width*.65), height-85
 
 
+def verified_search_contact(lines,account,width,height):
+    """Require a unique labelled account in a search result, with its own nickname."""
+    matches=[]
+    expected='微信号：'+compact(account)
+    for line in lines:
+        x,y,right,bottom=line_box(line)
+        if compact(line['text']).replace(':','：')!=expected:continue
+        if not (x<width*.45 and right<width*.75 and height*.08<y<height*.75):continue
+        names=[item for item in lines if 0<y-line_box(item)[3]<max(45,height*.06)
+               and abs(line_box(item)[0]-x)<max(45,width*.06)
+               and compact(item['text']) not in ('联系人','搜索','搜索联系人','聊天记录','微信号')
+               and '微信号' not in item['text']]
+        if not names:continue
+        nearest=max(line_box(item)[3] for item in names)
+        names=[item for item in names if line_box(item)[3]==nearest]
+        if len(names)==1:matches.append((line,compact(names[0]['text'])))
+    return matches[0] if len(matches)==1 else None
+
+
 def choose_archive_file(dialog, path):
     from qq_sender import controls_by_id, keyboard_activate
     edits = [edit for edit in controls_by_id(dialog, '1148', 'Edit')
@@ -151,9 +170,11 @@ def choose_archive_file(dialog, path):
     if len(edits) != 1:
         raise ValueError('微信文件选择窗口无法唯一定位文件名输入框，请查看 WECHAT file dialog 调试信息')
     editor = edits[0]
-    editor.set_edit_text(str(path))
-    wait_for(lambda: editor.get_value().strip().strip('"') == str(path),
-             '微信文件选择窗口未收到完整 ZIP 路径', timeout=3)
+    paths=path if isinstance(path,(list,tuple)) else [path]
+    text=str(paths[0]) if len(paths)==1 else ' '.join('"'+str(p)+'"' for p in paths)
+    editor.set_edit_text(text)
+    wait_for(lambda: editor.get_value().strip().strip('"') == text.strip('"'),
+             '微信文件选择窗口未收到完整附件路径', timeout=3)
     # Enter from File name invokes Open without confusing the split-button arrow.
     keyboard_activate(editor)
 
@@ -178,17 +199,21 @@ class WeChatVisualSender:
             screenshot = ImageGrab.grab(bbox=(rect.left, rect.top, rect.right, rect.bottom), all_screens=True)
             if header:
                 from PIL import ImageOps, Image
-                left,top=int(rect.width()*.25),28
-                right,bottom=int(rect.width()*.8),100
+                left,top=int(min(rect.width()*.25,220)),28
+                right,bottom=int(rect.width()*.8),min(140,int(rect.height()*.2))
                 cropped=screenshot.crop((left,top,right,bottom))
-                cropped=ImageOps.autocontrast(cropped.convert('L'))
-                cropped.resize((cropped.width*3,cropped.height*3),Image.Resampling.LANCZOS).save(path)
-                lines=recognize_image(path)
-                for line in lines:
-                    for word in line['words']:
-                        word['x']=word['x']/3+left;word['y']=word['y']/3+top
-                        word['w']/=3;word['h']/=3
-                return lines
+                gray=ImageOps.autocontrast(cropped.convert('L'))
+                # Color, high contrast, then inverted: dark themes and thin glyphs
+                # do not consistently survive the same OCR preprocessing.
+                for variant in (cropped,gray,ImageOps.invert(gray)):
+                    variant.resize((variant.width*3,variant.height*3),Image.Resampling.LANCZOS).save(path)
+                    lines=recognize_image(path)
+                    for line in lines:
+                        for word in line['words']:
+                            word['x']=word['x']/3+left;word['y']=word['y']/3+top
+                            word['w']/=3;word['h']/=3
+                    if chat_title_text(lines,rect.width(),rect.height()):return lines
+                return []
             screenshot.save(path)
             return recognize_image(path)
 
@@ -231,16 +256,17 @@ class WeChatVisualSender:
         # Ctrl+F also focuses a search field already containing the previous ID.
         self.window.type_keys('^a', set_foreground=False)
         self.paste_text(account)
-        time.sleep(.8)
+        # Allow the client to populate results before opening its selected match.
+        time.sleep(1)
         self.window.type_keys('{ENTER}', set_foreground=False)
-        time.sleep(.6)
-        def chat_title():
+        time.sleep(.5)
+        def opened_chat():
             lines = self.snapshot()
-            title = chat_title_text(lines,rect.width(),rect.height())
-            logger.debug('WECHAT chat title detected=%s header=%s window=%s',title,
-                         [(line['text'],line_box(line)) for line in lines if line_box(line)[1]<140],rect)
-            return title or self.read_chat_title()
-        self.nickname = wait_for(chat_title, '微信 Enter 后未确认聊天标题，请检查搜索结果', timeout=10)
+            # An open search overlay means Enter has not opened a conversation.
+            if search_lines(lines, rect.width(), rect.height(), {'搜索联系人', '无搜索结果', '无结果'}):
+                return None
+            return chat_title_text(lines, rect.width(), rect.height()) or self.read_chat_title()
+        self.nickname = wait_for(opened_chat, '未识别到微信聊天标题；可能已进入聊天，请展开窗口后继续', timeout=10)
         wait_for(self.check_target, '微信目标聊天尚未就绪', timeout=5)
         logger.info('WECHAT Enter search opened account=%s chat_title=%s', account, self.nickname)
 
@@ -293,10 +319,33 @@ class WeChatVisualSender:
         image = ImageGrab.grab(bbox=(rect.left,rect.top,rect.right,rect.bottom), all_screens=True)
         return [box for box in zip_icon_boxes(image) if box[0] > rect.width()/3]
 
+    def attachment_evidence(self,paths):
+        lines=self.snapshot();rect=self.window.rectangle()
+        # The file toolbar separates conversation history from the composer.
+        boundary=getattr(self,'composer_top',rect.height()*.72)
+        chat=[line for line in lines if line_box(line)[0]>rect.width()*.33
+              and 100<line_box(line)[1]<boundary]
+        draft=[line for line in lines if line_box(line)[0]>rect.width()*.25 and line_box(line)[1]>boundary]
+        def count_labels(name):
+            matches=sum(archive_label_matches(line['text'],name) for line in chat)
+            # File cards may wrap the filename across adjacent OCR lines.
+            for first in chat:
+                x,y,right,bottom=line_box(first)
+                for second in chat:
+                    sx,sy,_,_=line_box(second)
+                    if 0<=sy-bottom<=18 and abs(sx-x)<30:
+                        matches+=archive_label_matches(first['text']+second['text'],name)
+            return matches
+        icons=self.zip_icons() if any(Path(path).suffix.lower()=='.zip' for path in paths) else []
+        return {'files':{Path(path).name:count_labels(Path(path).name) for path in paths},
+                'zip_cards':sum(100<box[1] and box[3]<boundary for box in icons),
+                'failed':sum(any(word in line['text'] for word in ('发送失败','重新发送','网络异常')) for line in chat),
+                'draft':any(archive_label_matches(line['text'],Path(path).name) for line in draft for path in paths)
+                        or any(box[1]>boundary for box in icons)}
+
     def send_files(self, paths):
-        if len(paths) != 1 or Path(paths[0]).suffix.lower() != '.zip':
-            raise ValueError('微信只发送一个返图压缩包')
-        path = Path(paths[0]).resolve(strict=True)
+        from delivery import wechat_attachment_paths
+        paths=wechat_attachment_paths(paths)
         if not self.check_target():
             raise ValueError('微信目标聊天标题变化，未选择文件')
         initial = self.snapshot()
@@ -315,6 +364,8 @@ class WeChatVisualSender:
         logger.debug('WECHAT visual file icon window=%s point=%s', rect, point)
         if point is None:
             raise ValueError('微信发送文件图标未找到或出现多个候选，请展开目标聊天窗口')
+        self.composer_top=point[1]-12
+        before=self.attachment_evidence(paths)
         self.window.click_input(coords=point)
         from pywinauto import Desktop
         from qq_sender import controls_by_id
@@ -324,11 +375,25 @@ class WeChatVisualSender:
                        if window.is_visible() and controls_by_id(window, '1148', 'Edit')]
             return matches[0] if len(matches) == 1 else None
         dialog = wait_for(file_dialog, '点击微信文件按钮后未出现文件选择窗口', timeout=10)
-        choose_archive_file(dialog, path)
+        choose_archive_file(dialog, paths)
         wait_for(lambda: file_dialog() is None, '微信文件选择窗口尚未关闭，未向聊天按 Enter', timeout=10)
         time.sleep(.5)
         self.send_archive_enter()
-        logger.info('WECHAT ZIP submitted by Enter; upload continues in client; advancing queue')
+        if getattr(self,'defer_confirmation',False):
+            self.pending_confirmation={'paths':[str(p) for p in paths],'before':before,'composer_ratio':self.composer_top/self.window.rectangle().height()}
+            return
+        self.verify_attachment({'paths':[str(p) for p in paths],'before':before})
+
+    def verify_attachment(self,receipt):
+        paths,before=receipt['paths'],receipt['before']
+        if receipt.get('composer_ratio'):
+            self.composer_top=receipt['composer_ratio']*self.window.rectangle().height()
+        from wechat_confirmation import attachment_confirmed
+        def confirmed():
+            if not self.check_target():raise ValueError('微信聊天目标变化，请核对已提交附件')
+            return attachment_confirmed(paths,before,self.attachment_evidence(paths))
+        wait_for(confirmed,'无法确认本次附件已进入聊天记录，请核对后继续；不会自动标记已返图',timeout=20)
+        logger.info('WECHAT attachment messages verified count=%s',len(paths))
 
     def send_message(self, text):
         self.input_area()

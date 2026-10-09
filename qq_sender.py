@@ -133,6 +133,8 @@ def wait_for(operation, message, timeout=15):
     logger.debug('WAIT start: %s (timeout=%ss)', message, timeout)
     end = time.monotonic() + timeout
     while time.monotonic() < end:
+        from delivery_cancel import check_stop
+        check_stop()
         value = operation()
         if value:
             logger.debug('WAIT success: %s', message)
@@ -352,6 +354,28 @@ def restore_hidden_qq():
     return bool(handles)
 
 
+def confirm_message_copy(control, text, owner_handle):
+    """Read back the focused rich-text composer when UIA omits its text."""
+    import win32clipboard
+    control.type_keys('^a', set_foreground=False)
+    # Clear the pasted value first so a failed Copy cannot look successful.
+    win32clipboard.OpenClipboard(owner_handle)
+    try:win32clipboard.EmptyClipboard()
+    finally:win32clipboard.CloseClipboard()
+    control.type_keys('^c', set_foreground=False)
+    def copied():
+        try:
+            win32clipboard.OpenClipboard(owner_handle)
+            try:
+                if not win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_UNICODETEXT):return False
+                value=win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
+            finally:win32clipboard.CloseClipboard()
+        except Exception:return False
+        normalize=lambda value:value.replace('\r\n','\n').replace('\r','\n').strip()
+        return normalize(value)==normalize(text)
+    wait_for(copied,'无法从 QQ 输入框回读完整留言，请核对草稿',timeout=3)
+
+
 class QQSender:
     def __init__(self):
         logger.info('SENDER version=%s flow=%s source=%s', APP_VERSION, QQ_FLOW_VERSION, __file__)
@@ -541,27 +565,19 @@ class QQSender:
             # Stay in the pinned chat; coordinates are relative to its current
             # toolbar and send button, including on secondary monitors.
             paste_message(self.chat, text, self.chat.handle)
-            def typed():
-                bounds = self.chat.rectangle()
-                floor = self.chat.descendants(title='文件弹出菜单', control_type='Button')[0].rectangle().bottom
-                for e in self.chat.descendants():
-                    rect = e.rectangle()
-                    if rect.top >= floor and rect.bottom <= bounds.bottom and e.window_text().strip() == text:
-                        return True
-                return False
-            wait_for(typed, '未确认留言文字已进入编辑区，未点击发送，请核对草稿', timeout=5)
         else:
             if editor.window_text().strip() not in ('', '输入', '输入消息', '消息输入框', '消息输入'):
                 raise ValueError('聊天输入框已有草稿，未追加返图留言')
             editor.set_focus()
             wait_for(editor.has_keyboard_focus, '聊天输入框未获得键盘焦点，未输入留言', timeout=3)
             paste_message(editor, text, self.chat.handle)
-        def ready_send():
-            buttons = [e for e in self.chat.descendants(title='发送')
-                       if e.element_info.control_type in ('Button', 'SplitButton')
-                       and e.is_visible() and e.is_enabled()]
-            return buttons[0] if len(buttons) == 1 else None
-        wait_for(ready_send, '无法唯一定位可用的聊天发送按钮', timeout=5).click_input()
+        time.sleep(.3)
+        if not chat_matches(self.chat,self.nickname) or process_executable(self.chat.process_id())!=self.qq_executable:
+            raise ValueError('留言发送前聊天对象发生变化')
+        # The user configures QQ to send with Enter. Keep focus in the composer.
+        self.chat.type_keys('{ENTER}',set_foreground=False)
+        logger.info('QQ completion message Enter submitted once')
+        if getattr(self,'defer_confirmation',False):return
         def message_present():
             lists = [e for e in self.chat.descendants() if e.window_text() == '消息列表']
             return len(lists) == 1 and any(e.window_text() == text for e in lists[0].descendants())

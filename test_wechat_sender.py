@@ -22,6 +22,10 @@ class WeChatTargetTests(unittest.TestCase):
         sender.read_chat_title.return_value='其他人'
         self.assertFalse(sender.check_target())
 
+    def test_wide_window_title_is_not_cut_off_by_relative_sidebar(self):
+        lines=[{'text':'联系人','words':[{'x':285,'y':54,'w':100,'h':20}]}]
+        self.assertEqual(chat_title_text(lines,1600,900),'联系人')
+
     def test_chat_title_can_be_left_of_one_third_of_window(self):
         def line(text,x,y,w=100):
             return {'text':text,'words':[{'x':x,'y':y,'w':w,'h':20}]}

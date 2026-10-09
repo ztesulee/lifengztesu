@@ -1,0 +1,21 @@
+return {
+    LrSdkVersion = 6.0,
+    LrSdkMinimumVersion = 6.0,
+    LrToolkitIdentifier = 'com.ztesulee.photoreturn',
+    LrPluginName = '摄影返图 · QQ / 微信',
+    VERSION = { major = 0, minor = 1, revision = 29, build = 30 },
+    LrForceInitPlugin = true,
+    LrInitPlugin = 'Init.lua',
+    LrShutdownPlugin = 'Shutdown.lua',
+    LrMetadataProvider = 'Metadata.lua',
+    LrMetadataTagsetFactory = 'MetadataTagsets.lua',
+    LrExportServiceProvider = { title = '摄影返图 · QQ / 微信', file = 'ExportService.lua' },
+    LrExportMenuItems = {
+        { title = '返图：绑定选中照片所在人物文件夹', file = 'BindFolders.lua' },
+        { title = '返图：绑定人物父文件夹（子文件夹继承）', file = 'BindParent.lua' },
+        { title = '返图：查看文件夹及子文件夹返图状态', file = 'FolderStatus.lua' },
+        { title = '返图：发送当前人物文件夹全部素材', file = 'SendFolder.lua' },
+        { title = '返图：发送已选中素材（读取元数据账号）', file = 'SendSelected.lua', enabledWhen='photosSelected' },
+        { title = '返图：连接设置与任务状态', file = 'TaskStatus.lua' },
+    },
+}

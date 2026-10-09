@@ -72,6 +72,7 @@ class Project:
         self.cache = self.folder / 'previews'
         self.cache.mkdir(exist_ok=True)
         self.lock = threading.RLock()
+        self.archive_lock = threading.RLock()
         self.workers = ThreadPoolExecutor(max_workers=1, thread_name_prefix='pack')
         self.file = self.folder / 'project.json'
         if self.file.exists():
@@ -85,7 +86,7 @@ class Project:
         for submission in self.data['submissions']:
             if submission.get('delivery_version') == 1 and submission['status'] in ('sending', 'queued'):
                 submission['status'] = 'needs_review' if submission.get('inflight') else 'waiting'
-                submission['error'] = '软件重启，请检查上次发送状态后继续'
+                submission['error'] = '上次后台启动时暂停了此任务；可多选任务后点击“核对 / 继续选中任务”恢复'
             elif submission.get('delivery_version') != 1:
                 submission['legacy_package'] = True
         self.save()
@@ -253,7 +254,7 @@ class Project:
             self.save()  # acknowledge only after the request is on disk
             return copy.deepcopy(submission)
 
-    def queue_direct_albums(self, gids, channel='default', item_ids=None):
+    def queue_direct_albums(self, gids, channel='default', item_ids=None, persist=True):
         """Create durable whole-album tasks without requiring web publication."""
         with self.lock:
             if item_ids is not None:
@@ -293,12 +294,13 @@ class Project:
                     'created':time.strftime('%Y-%m-%d %H:%M:%S'), 'status':'queued', 'error':'',
                     'delivery_version':1,'sent_files':[],'inflight':'','recipient':recipient,
                     'source':'direct','direct_signature':signature,
-                    'material_scope':'partial' if item_ids is not None else 'all'}
+                    'material_scope':'partial' if item_ids is not None else 'all',
+                    'archive_directory':group.get('archive_directory','')}
                 prepared.append((record, True))
             for record, fresh in prepared:
                 if fresh:
                     self.data['submissions'].append(record)
-            self.save()
+            if persist:self.save()
             return [copy.deepcopy(record) for record, _ in prepared]
 
     def delete_delivery_tasks(self, ids):
@@ -317,6 +319,14 @@ class Project:
             return len(selected)
 
     def prepare_archive(self, sid, channel, files=None):
+        from delivery_cancel import check_stop
+        while not self.archive_lock.acquire(timeout=.1):check_stop()
+        try:
+            check_stop()
+            return self._prepare_archive(sid,channel,files)
+        finally:self.archive_lock.release()
+
+    def _prepare_archive(self, sid, channel, files=None):
         from delivery import selected_files
         with self.lock:
             record = next(s for s in self.data['submissions'] if s['id'] == sid)
@@ -333,7 +343,13 @@ class Project:
             raise ValueError('没有需要打包的原片')
         signature = hashlib.sha256(json.dumps({'channel':channel, 'account':account,
                     'files':[(f['id'], f['size'], f['mtime']) for f in subset['files']]}, sort_keys=True).encode()).hexdigest()[:16]
+        with self.lock:
+            cached=Path(record.get('archive_path',''))
+            if record.get('archive_signature')==signature and cached.is_file() and record.get('archive_fingerprint')==fingerprint(cached):
+                return cached
         folder = self.group_folder(record['group']) if channel == 'wechat' else self.folder / '返图压缩包' / safe_name(sid) / signature
+        if channel=='wechat' and record.get('archive_directory'):
+            folder=Path(record['archive_directory'])
         folder.mkdir(parents=True, exist_ok=True)
         if channel == 'wechat':
             with self.lock:
@@ -362,20 +378,29 @@ class Project:
                         name = f'{path.stem}_{index}{path.suffix}'
                         index += 1
                     names.add(name.casefold())
-                    package.write(path, name)
+                    from delivery_cancel import check_stop
+                    check_stop()
+                    with path.open('rb') as source,package.open(name,'w',force_zip64=True) as destination:
+                        while True:
+                            check_stop()
+                            chunk=source.read(1024*1024)
+                            if not chunk:break
+                            destination.write(chunk)
                     if fingerprint(path) != {'size':original['size'], 'mtime':original['mtime']}:
                         raise ValueError('打包期间原片发生变化：' + path.name)
+            check_stop()
             os.replace(temp, archive)
         except Exception:
             temp.unlink(missing_ok=True)
             raise
         with self.lock:
-            record.update(archive_path=str(archive), archive_items=[f['id'] for f in subset['files']], archive_channel=channel)
+            record.update(archive_path=str(archive), archive_items=[f['id'] for f in subset['files']], archive_channel=channel,
+                          archive_signature=signature,archive_fingerprint=fingerprint(archive))
             self.save()
         logger.info('ARCHIVE prepared task=%s channel=%s originals=%s bytes=%s', sid, channel, len(paths), archive.stat().st_size)
         return archive
 
-    def deliver(self, sid, sender):
+    def deliver(self, sid, sender, on_prepared=None):
         with self.lock:
             record = next(s for s in self.data['submissions'] if s['id'] == sid)
             if record['status'] not in ('queued', 'waiting', 'error') or record.get('inflight'):
@@ -389,28 +414,34 @@ class Project:
             record.update(status='sending', error='', delivery_phase='packing' if channel == 'wechat' else 'preparing_originals')
             self.save()
         try:
+            from delivery_cancel import check_stop
+            check_stop()
             logger.info('TASK start id=%s channel=%s account=%s files=%s already_sent=%s', sid, channel, account, len(record['files']), len(record['sent_files']))
             remaining = [f for f in record['files'] if f['id'] not in record['sent_files']]
+            wechat_zip = channel == 'wechat' and (len(record['files']) >= 9 or any(f.get('kind') != 'photo' for f in record['files']))
             if remaining:
-                if channel == 'wechat':
+                if wechat_zip:
                     payload = [self.prepare_archive(sid, channel, remaining)]
                 else:
-                    if not account.isdigit():
+                    if channel=='qq' and not account.isdigit():
                         raise ValueError('QQ 号必须为纯数字')
                     from delivery import selected_files
                     subset = copy.deepcopy(record)
                     subset['files'] = remaining
                     payload = selected_files(self, subset)
+            if on_prepared:on_prepared()
             with self.lock:
                 record['delivery_phase'] = 'connecting'
                 self.save()
+            check_stop()
             sender.connect(account)
+            check_stop()
             if remaining:
                 ids = [f['id'] for f in remaining]
                 with self.lock:
                     record.update(inflight=ids[0], inflight_batch=ids,
-                                  delivery_method='wechat_zip' if channel == 'wechat' else 'qq_flash',
-                                  delivery_phase='sending_archive' if channel == 'wechat' else 'sending_originals')
+                                  delivery_method=('wechat_zip' if wechat_zip else 'wechat_photos') if channel == 'wechat' else 'qq_flash',
+                                  delivery_phase='sending_archive' if wechat_zip else 'sending_originals')
                     self.save()
                 if callable(getattr(sender, 'send_files', None)):
                     sender.send_files(payload)
@@ -418,14 +449,18 @@ class Project:
                     for path in payload:
                         sender.send_file(path)
                 with self.lock:
+                    if getattr(sender,'pending_confirmation',None):
+                        record['pending_confirmation']=sender.pending_confirmation
                     record['sent_files'].extend(ids)
                     record.update(inflight='', inflight_batch=[])
                     self.save()
+            check_stop()
             note_error = ''
             if callable(getattr(sender, 'send_message', None)) and not record.get('completion_message_status'):
                 with self.lock:
                     person = self.data['groups'].get(record['group'], {}).get('name') or record.get('name', '').split(' · ')[0]
-                    text = ('QQ/微信号：' + account + '\n' + person + '老师您好，您的返图已全部发送完毕。感谢您的出镜与配合，辛苦您收到后回复确认，祝您生活愉快！\n日期：' + time.strftime('%Y年%m月%d日 %H点%M分') + '\n（本消息为系统自动发送）')
+                    body=record.get('completion_message_body','您的返图已全部发送完毕。感谢您的出镜与配合，辛苦您收到后回复确认，祝您生活愉快！')
+                    text = ('QQ/微信号：' + account + '\n' + person + '老师您好，\n' + body + '\n日期：' + time.strftime('%Y年%m月%d日 %H点%M分') + '\n（本消息为系统自动发送）')
                     record.update(completion_message=text, completion_message_status='started')
                     self.save()
                 try:
@@ -439,7 +474,9 @@ class Project:
                 note_error = '；留言结果未确认，未重复留言'
             with self.lock:
                 record.update(status='submitted', error='已交给'+(' QQ ' if channel == 'qq' else '微信')+'发送，请在客户端确认传输与收件状态' + note_error)
-                sent=set(record.get('sent_files',[]))
+                if record.get('pending_confirmation'):
+                    record.update(status='pending_review',error='附件和留言已操作提交，等待本轮发送结束后统一核对')
+                sent=set(record.get('sent_files',[])) if not record.get('pending_confirmation') else set()
                 delivered={file['id']:file for file in record['files'] if file['id'] in sent}
                 for item in self.data['items']:
                     file=delivered.get(item['id'])
@@ -450,7 +487,8 @@ class Project:
         except Exception as exc:
             logger.exception('TASK failed id=%s inflight=%s: %s', sid, bool(record.get('inflight')), exc)
             with self.lock:
-                record.update(status='needs_review' if record.get('inflight') else 'error', error=str(exc))
+                from delivery_cancel import DeliveryStopped
+                record.update(status='needs_review' if record.get('inflight') else ('cancelled' if isinstance(exc,DeliveryStopped) else 'error'), error=str(exc))
                 self.save()
 
     def close(self):

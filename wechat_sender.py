@@ -1,6 +1,7 @@
 """Targeted WeChat UIA file sending; stop when the contact cannot be verified."""
 import ctypes
 import re
+import time
 from pathlib import Path
 from qq_sender import QQSender, process_executable, window_minimized, wait_for
 from debug_log import logger
@@ -49,6 +50,7 @@ class WeChatSender(QQSender):
         if not main.descendants(control_type='Edit'):
             from wechat_visual import WeChatVisualSender
             self.visual = WeChatVisualSender(main)
+            self.visual.defer_confirmation=getattr(self,"defer_confirmation",False)
             self.visual.connect(self.account)
             return
         self.pid = main.process_id()
@@ -64,43 +66,28 @@ class WeChatSender(QQSender):
         from delivery import paste_message
         paste_message(search, self.account, main.handle)
         wait_for(lambda: search.get_value().strip() == self.account, '微信搜索框未收到完整账号', timeout=5)
-        def contact():
-            rows = []
-            for kind in ('ListItem', 'Group'):
-                for row in main.descendants(control_type=kind):
-                    texts = [row.window_text()] + [e.window_text() for e in row.descendants(control_type='Text')]
-                    if exact_wechat_result('\n'.join(texts), self.account) and row.is_visible():
-                        rows.append((row, texts))
-                if rows:
-                    break
-            # Nested groups repeat the same contact; the smallest verified row
-            # excludes ancestor panels containing several unrelated results.
-            if not rows:
-                return None
-            areas = [(r.rectangle().width()*r.rectangle().height(), r, texts) for r, texts in rows]
-            if not any(a > 0 for a, _, _ in areas):
-                return None
-            smallest = min(a for a, _, _ in areas if a > 0)
-            chosen = [(r, t) for a, r, t in areas if a == smallest]
-            if len(chosen) != 1:
-                raise ValueError('微信号精确匹配结果不唯一，未发送')
-            return chosen[0]
-        row, texts = wait_for(contact, '微信结果未显示完全匹配的微信号；未按昵称或相似联系人发送')
-        labels = [t.strip() for t in texts if t.strip() and not exact_wechat_result(t, self.account)
-                  and t.strip() not in ('联系人', self.account)]
-        if not labels:
-            raise ValueError('无法核对微信联系人名称，未发送')
-        self.nickname = labels[0]
-        row.click_input()
+        time.sleep(1)
+        search.type_keys('{ENTER}', set_foreground=False)
+        time.sleep(.5)
+        self.nickname = None
         def activated_chat():
             handle = ctypes.windll.user32.GetForegroundWindow()
             window = self.desktop.window(handle=handle).wrapper_object()
             if window.process_id() != self.pid:
                 return None
+            if self.nickname is None:
+                bounds = window.rectangle()
+                titles = [e.window_text().strip() for e in window.descendants(control_type='Text')
+                          if e.is_visible() and e.window_text().strip()
+                          and e.rectangle().left > bounds.left + bounds.width()/3
+                          and bounds.top <= e.rectangle().top < bounds.top + min(120, bounds.height()/4)]
+                if not titles:
+                    return None
+                self.nickname = titles[0]
             if not self.matches_chat_header(window):
                 return None
             return window
-        self.chat = wait_for(activated_chat, '微信未打开已核对联系人聊天')
+        self.chat = wait_for(activated_chat, '微信尚未进入聊天窗口，请确认微信号能搜索到联系人')
         logger.info('WECHAT target pinned pid=%s handle=%s', self.pid, self.chat.handle)
 
     def matches_chat_header(self, window):
@@ -119,28 +106,55 @@ class WeChatSender(QQSender):
             raise ValueError('无法唯一定位微信聊天编辑区')
         return editors[0]
 
+    def attachment_evidence(self,paths):
+        editor=self.editor();bounds=self.chat.rectangle();top=editor.rectangle().top
+        messages=[];images=0
+        for element in self.chat.descendants():
+            if not element.is_visible():continue
+            rect=element.rectangle()
+            if not (bounds.top+100<rect.top<top and rect.left>bounds.left+bounds.width()*.45):continue
+            if element.element_info.control_type=='Text':messages.append(element.window_text())
+            if element.element_info.control_type=='Image' and rect.width()>=80 and rect.height()>=60:
+                images+=1
+        from wechat_visual import archive_label_matches
+        return {'files':{Path(path).name:sum(archive_label_matches(text,Path(path).name) for text in messages) for path in paths},
+                'images':images,'draft':bool(editor.get_value().strip()),
+                'failed':sum(any(word in text for word in ('发送失败','重新发送','网络异常')) for text in messages)}
+
     def send_files(self, paths):
         if getattr(self, 'visual', None) is not None:
-            return self.visual.send_files(paths)
-        from delivery import copy_files
-        if len(paths) != 1 or Path(paths[0]).suffix.lower() != '.zip':
-            raise ValueError('微信仅发送本任务生成的一个 ZIP')
-        path = Path(paths[0]).resolve(strict=True)
+            result=self.visual.send_files(paths)
+            self.pending_confirmation=getattr(self.visual,'pending_confirmation',None)
+            return result
+        from delivery import copy_files, wechat_attachment_paths
+        paths=wechat_attachment_paths(paths)
+        before=self.attachment_evidence(paths)
         editor = self.editor()
         if editor.get_value().strip():
             raise ValueError('微信输入区有草稿，未粘贴压缩包')
-        before = sum(e.window_text() == path.name for e in self.chat.descendants())
         self.chat.set_focus()
         editor.set_focus()
         wait_for(editor.has_keyboard_focus, '微信编辑区未获得焦点', timeout=3)
-        copy_files([path], self.chat.handle)
+        copy_files(paths, self.chat.handle)
         editor.type_keys('^v', set_foreground=False)
         def send_button():
             buttons = [e for e in self.chat.descendants(title='发送', control_type='Button')
                        if e.is_visible() and e.is_enabled()]
             return buttons[0] if len(buttons) == 1 else None
         wait_for(send_button, '微信文件确认发送按钮未就绪').click_input()
-        logger.info('WECHAT ZIP submitted; upload continues in client; advancing queue')
+        if getattr(self,'defer_confirmation',False):
+            self.pending_confirmation={'paths':[str(p) for p in paths],'before':before}
+            return
+        self.verify_attachment({'paths':[str(p) for p in paths],'before':before})
+
+    def verify_attachment(self,receipt):
+        if getattr(self,'visual',None) is not None:
+            return self.visual.verify_attachment(receipt)
+        paths,before=receipt['paths'],receipt['before']
+        from wechat_confirmation import attachment_confirmed
+        wait_for(lambda:attachment_confirmed(paths,before,self.attachment_evidence(paths)),
+                 '无法确认本次附件已进入聊天记录，请核对后继续；不会自动标记已返图',timeout=20)
+        logger.info('WECHAT attachment messages verified count=%s',len(paths))
 
     def send_message(self, text):
         if getattr(self, 'visual', None) is not None:
@@ -157,5 +171,6 @@ class WeChatSender(QQSender):
         if len(buttons) != 1:
             raise ValueError('微信留言发送按钮不唯一')
         buttons[0].click_input()
+        if getattr(self,'defer_confirmation',False):return
         wait_for(lambda: any(e.window_text() == text for e in self.chat.descendants()) and not editor.get_value().strip(),
                  '微信留言未确认', timeout=15)

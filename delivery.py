@@ -19,6 +19,15 @@ def paste_message(control, text, owner_handle):
 from media import fingerprint
 
 
+def wechat_attachment_paths(paths):
+    from media import PHOTOS, RAW
+    result=[Path(path).resolve(strict=True) for path in paths]
+    if len(result)==1 and result[0].suffix.lower()=='.zip':return result
+    if not 1<=len(result)<=8 or any(path.suffix.lower() not in PHOTOS | RAW for path in result):
+        raise ValueError('微信直接发送限 1–8 张图片；9 张及以上或含视频请打包 ZIP')
+    return result
+
+
 def selected_files(project, submission):
     items = {i['id']: i for i in project.snapshot()['items']}
     result = []

@@ -10,6 +10,38 @@ from types import SimpleNamespace
 
 
 class QQCompatibilityTests(unittest.TestCase):
+    def test_message_pastes_then_enters_once_in_both_editor_modes(self):
+        for rich in (False,True):
+            with self.subTest(rich=rich):
+                sender=QQSender.__new__(QQSender)
+                sender.chat=Mock();sender.nickname='person';sender.qq_executable='qq.exe';sender.defer_confirmation=True
+                editor=Mock();editor.window_text.return_value=''
+                events=[]
+                sender.chat.type_keys.side_effect=lambda keys,**kw:events.append(keys)
+                with patch('qq_sender.chat_matches',return_value=True), patch('qq_sender.process_executable',return_value='qq.exe'), patch('qq_sender.find_chat_input',side_effect=ValueError() if rich else None,return_value=editor), patch('qq_sender.message_input_point',return_value=(60,400)), patch('qq_sender.time.sleep'), patch('delivery.paste_message',side_effect=lambda *args:events.append('paste')):
+                    sender.send_message('hello\nworld')
+                self.assertEqual(events,['paste','{ENTER}'])
+                sender.chat.descendants.assert_not_called()
+
+    def test_rich_text_copy_clears_stale_clipboard_and_normalizes_newlines(self):
+        from qq_sender import confirm_message_copy
+        clipboard=Mock();clipboard.CF_UNICODETEXT=13
+        clipboard.GetClipboardData.return_value='hello\r\nworld'
+        control=Mock()
+        with patch.dict('sys.modules',{'win32clipboard':clipboard}), patch('qq_sender.wait_for',side_effect=lambda fn,*a,**k:self.assertTrue(fn())):
+            confirm_message_copy(control,'hello\nworld',123)
+        clipboard.EmptyClipboard.assert_called_once()
+        self.assertEqual([c.args[0] for c in control.type_keys.call_args_list],['^a','^c'])
+
+    def test_rich_text_copy_rejects_missing_or_different_text(self):
+        from qq_sender import confirm_message_copy
+        clipboard=Mock();clipboard.CF_UNICODETEXT=13
+        clipboard.GetClipboardData.return_value='other draft'
+        with patch.dict('sys.modules',{'win32clipboard':clipboard}), patch('qq_sender.wait_for',side_effect=lambda fn,*a,**k:self.assertFalse(fn())):
+            confirm_message_copy(Mock(),'expected',123)
+            clipboard.IsClipboardFormatAvailable.return_value=False
+            confirm_message_copy(Mock(),'expected',123)
+
     def test_hidden_duplicate_chat_controls_do_not_block_visible_chat(self):
         window, header, hidden, file, messages = [Mock() for _ in range(5)]
         hidden.is_visible.return_value=False

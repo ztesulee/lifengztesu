@@ -13,6 +13,11 @@ build/
 
 # Photography projects, contact accounts and machine settings
 projects/
+.lightroom-state/
+.lightroom-tools/
+.packaging-tools/
+release/
+build/
 .last-project.json
 .history-notice.json
 .openfrp-settings.json
